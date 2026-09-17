@@ -145,6 +145,21 @@ def plot_confusion_matrix(cm, class_names, output_dir: Path):
     plt.close(fig)
 
 
+def _selection_metric_value(val_acc: float, precision: float, recall: float, f1: float, metric: str) -> float:
+    """Return the metric value used for best-model selection.
+
+    Higher is always better for all supported metrics. For crack detection,
+    val_recall or val_f1 is usually more meaningful than val_accuracy.
+    """
+    if metric == "val_accuracy":
+        return val_acc
+    if metric == "val_f1":
+        return f1
+    if metric == "val_recall":
+        return recall
+    raise ValueError(f"Unknown selection metric: {metric}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data")
@@ -156,6 +171,12 @@ def main():
                          help="Also fine-tune layer4, not just the final FC layer")
     parser.add_argument("--max_per_class", type=int, default=None,
                          help="Optional cap on train images per class (val uses 1/4 of this)")
+    parser.add_argument(
+        "--selection_metric",
+        choices=["val_accuracy", "val_f1", "val_recall"],
+        default="val_accuracy",
+        help="Metric used to choose the best checkpoint (higher is better)",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -175,8 +196,10 @@ def main():
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
 
-    history = {"train_loss": [], "val_acc": []}
-    best_acc = 0.0
+    history = {"train_loss": [], "val_acc": [], "val_precision": [], "val_recall": [], "val_f1": []}
+    best_selection = -1.0
+    best_acc = -1.0
+    best_f1 = -1.0
     start_time = time.time()
     best_path = output_dir / "crack_classifier.pth"
 
@@ -197,12 +220,19 @@ def main():
 
         history["train_loss"].append(avg_loss)
         history["val_acc"].append(val_acc)
+        history["val_precision"].append(precision)
+        history["val_recall"].append(recall)
+        history["val_f1"].append(f1)
 
         print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_acc={val_acc:.2f}%, "
               f"precision={precision:.3f}, recall={recall:.3f}, f1={f1:.3f}")
 
-        if val_acc > best_acc:
+        # Model selection using configurable metric (polarity = higher-is-better)
+        selection_val = _selection_metric_value(val_acc, precision, recall, f1, args.selection_metric)
+        if selection_val > best_selection:
+            best_selection = selection_val
             best_acc = val_acc
+            best_f1 = f1
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "class_to_idx": class_to_idx,
@@ -211,24 +241,44 @@ def main():
     elapsed = time.time() - start_time
     print(f"\nTraining finished in {elapsed/60:.1f} min. Best val accuracy: {best_acc:.2f}%")
 
+    # --- Last-vs-best evaluation ---
+    # Evaluate the final (last-epoch) model
+    last_acc, last_precision, last_recall, last_f1, last_cm = evaluate(model, val_loader, device, pos_label)
+
+    # Load and evaluate the best checkpoint
     checkpoint = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
-    _, precision, recall, f1, cm = evaluate(model, val_loader, device, pos_label)
+    best_acc_final, best_precision, best_recall, best_f1, best_cm = evaluate(model, val_loader, device, pos_label)
 
     plot_training_curves(history, output_dir)
     class_names = [k for k, v in sorted(class_to_idx.items(), key=lambda x: x[1])]
-    plot_confusion_matrix(cm, class_names, output_dir)
+    plot_confusion_matrix(best_cm, class_names, output_dir)
 
     metrics = {
-        "best_val_accuracy": round(best_acc, 2),
-        "precision_crack": round(precision, 3),
-        "recall_crack": round(recall, 3),
-        "f1_crack": round(f1, 3),
+        "best_val_accuracy": round(best_acc_final, 2),
+        "precision_crack": round(best_precision, 3),
+        "recall_crack": round(best_recall, 3),
+        "f1_crack": round(best_f1, 3),
         "epochs": args.epochs,
         "train_images": len(train_loader.dataset),
         "val_images": len(val_loader.dataset),
         "unfroze_last_block": args.unfreeze_last_block,
         "positive_class": "crack",
+        # Last-vs-best: shows whether the final epoch beat the saved best checkpoint
+        "last_epoch": {
+            "val_accuracy": round(last_acc, 2),
+            "precision_crack": round(last_precision, 3),
+            "recall_crack": round(last_recall, 3),
+            "f1_crack": round(last_f1, 3),
+        },
+        "best_epoch": {
+            "val_accuracy": round(best_acc_final, 2),
+            "precision_crack": round(best_precision, 3),
+            "recall_crack": round(best_recall, 3),
+            "f1_crack": round(best_f1, 3),
+        },
+        "model_selection_metric": args.selection_metric,
+        "model_selection_polarity": "higher_is_better",
     }
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)

@@ -2,6 +2,7 @@ venv/
 __pycache__/
 *.pyc
 data/
+dataset/
 models/
 *.pth
 .DS_Store
