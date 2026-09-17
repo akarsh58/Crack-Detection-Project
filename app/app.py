@@ -2,7 +2,7 @@
 app.py
 
 Streamlit demo: upload a structural photo, get a crack / no-crack
-prediction with a confidence score. This is the piece that turns the
+prediction with a model confidence score. This is the piece that turns the
 project from "a notebook" into a clickable portfolio artifact.
 
 Run locally:
@@ -46,26 +46,30 @@ def load_model():
 
 
 def predict(model, idx_to_class, image: Image.Image):
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-    tensor = transform(image.convert("RGB")).unsqueeze(0)
+    try:
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+        tensor = transform(image.convert("RGB")).unsqueeze(0)
 
-    with torch.no_grad():
-        logits = model(tensor)
-        probs = F.softmax(logits, dim=1)[0]
-        pred_idx = int(torch.argmax(probs))
+        with torch.no_grad():
+            logits = model(tensor)
+            probs = F.softmax(logits, dim=1)[0]
+            pred_idx = int(torch.argmax(probs))
 
-    return idx_to_class[pred_idx], float(probs[pred_idx])
+        return idx_to_class[pred_idx], float(probs[pred_idx]), None
+    except Exception as e:
+        return None, None, str(e)
 
 
 st.title("🔍 Structural Crack Detector")
 st.write(
     "Upload a photo of concrete, pavement, or another structural surface. "
     "The model flags whether it thinks a crack is present, as a first-pass "
-    "screening tool — not a substitute for an inspector's judgment."
+    "screening tool — not a substitute for an inspector's judgment. "
+    "The confidence score is the model's softmax output, not a calibrated probability."
 )
 
 model, idx_to_class = load_model()
@@ -79,24 +83,33 @@ else:
     uploaded = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
 
     if uploaded:
-        image = Image.open(uploaded)
+        try:
+            image = Image.open(uploaded)
+        except Exception as e:
+            st.error(f"Failed to load image: {e}")
+            st.stop()
+
         col1, col2 = st.columns([1, 1])
 
         with col1:
             st.image(image, caption="Uploaded image", use_container_width=True)
 
         with col2:
-            label, confidence = predict(model, idx_to_class, image)
-            if label == "crack":
-                st.error(f"⚠️ Crack detected")
+            label, confidence, error = predict(model, idx_to_class, image)
+            if error:
+                st.error(f"Prediction failed: {error}")
             else:
-                st.success(f"✅ No crack detected")
-            st.metric("Confidence", f"{confidence*100:.1f}%")
-            st.caption(
-                "This is a screening signal, not a certified structural "
-                "assessment. Low-confidence or borderline results should "
-                "always go to a human reviewer."
-            )
+                if label == "crack":
+                    st.error(f"⚠️ Crack detected")
+                else:
+                    st.success(f"✅ No crack detected")
+                st.metric("Model confidence score", f"{confidence*100:.1f}%")
+                st.caption(
+                    "This is a screening signal, not a certified structural "
+                    "assessment. The confidence score is the model's softmax output, "
+                    "not a calibrated probability. Low-confidence or borderline results "
+                    "should always go to a human reviewer."
+                )
 
 st.divider()
 st.caption(

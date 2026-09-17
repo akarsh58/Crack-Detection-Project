@@ -20,10 +20,12 @@ Outputs (into --output_dir, default "models/"):
 import argparse
 import json
 import os
+import random
 import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
@@ -33,16 +35,58 @@ from tqdm import tqdm
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+SEED = 42
+
+
+def set_seed(seed: int):
+    """Set deterministic seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def _limit_per_class(dataset: datasets.ImageFolder, max_per_class: int) -> Subset:
-    counts = {i: 0 for i in range(len(dataset.classes))}
-    keep = []
+    """Limit to max_per_class images per class using reproducible random sampling."""
+    class_indices = {i: [] for i in range(len(dataset.classes))}
     for idx, (_, label) in enumerate(dataset.samples):
-        if counts[label] < max_per_class:
-            keep.append(idx)
-            counts[label] += 1
+        class_indices[label].append(idx)
+
+    random.seed(SEED)
+    keep = []
+    for label, indices in class_indices.items():
+        random.shuffle(indices)
+        keep.extend(indices[:max_per_class])
+
     return Subset(dataset, keep)
+
+
+def validate_dataset_structure(data_dir: Path):
+    """Validate that the dataset has the expected structure."""
+    required_dirs = [
+        data_dir / "train",
+        data_dir / "val",
+        data_dir / "train" / "crack",
+        data_dir / "train" / "no_crack",
+        data_dir / "val" / "crack",
+        data_dir / "val" / "no_crack",
+    ]
+
+    for dir_path in required_dirs:
+        if not dir_path.exists():
+            raise SystemExit(f"Required directory not found: {dir_path}")
+
+    # Check that each class has at least one image
+    for split in ["train", "val"]:
+        for class_name in ["crack", "no_crack"]:
+            class_dir = data_dir / split / class_name
+            images = list(class_dir.glob("*.jpg")) + list(class_dir.glob("*.jpeg")) + list(class_dir.glob("*.png"))
+            if not images:
+                raise SystemExit(f"No images found in {class_dir}")
 
 
 def build_dataloaders(data_dir: Path, batch_size: int, max_per_class: int | None):
@@ -110,6 +154,10 @@ def evaluate(model, loader, device, pos_label: int):
             correct += (predicted == labels).sum().item()
             all_preds.extend(predicted.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
+
+    if total == 0:
+        return 0.0, 0.0, 0.0, 0.0, [[0, 0], [0, 0]]
+
     accuracy = 100 * correct / total
     precision, recall, f1, _ = precision_recall_fscore_support(
         all_labels, all_preds, average="binary", pos_label=pos_label, zero_division=0
@@ -179,9 +227,13 @@ def main():
     )
     args = parser.parse_args()
 
+    set_seed(SEED)
+
     data_dir = Path(args.data_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    validate_dataset_structure(data_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -199,6 +251,8 @@ def main():
     history = {"train_loss": [], "val_acc": [], "val_precision": [], "val_recall": [], "val_f1": []}
     best_selection = -1.0
     best_acc = -1.0
+    best_precision = -1.0
+    best_recall = -1.0
     best_f1 = -1.0
     start_time = time.time()
     best_path = output_dir / "crack_classifier.pth"
@@ -232,10 +286,15 @@ def main():
         if selection_val > best_selection:
             best_selection = selection_val
             best_acc = val_acc
+            best_precision = precision
+            best_recall = recall
             best_f1 = f1
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "class_to_idx": class_to_idx,
+                "selection_metric": args.selection_metric,
+                "seed": SEED,
+                "epoch": epoch + 1,
             }, best_path)
 
     elapsed = time.time() - start_time
@@ -248,7 +307,7 @@ def main():
     # Load and evaluate the best checkpoint
     checkpoint = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
-    best_acc_final, best_precision, best_recall, best_f1, best_cm = evaluate(model, val_loader, device, pos_label)
+    best_acc_final, best_precision_final, best_recall_final, best_f1_final, best_cm = evaluate(model, val_loader, device, pos_label)
 
     plot_training_curves(history, output_dir)
     class_names = [k for k, v in sorted(class_to_idx.items(), key=lambda x: x[1])]
@@ -256,29 +315,23 @@ def main():
 
     metrics = {
         "best_val_accuracy": round(best_acc_final, 2),
-        "precision_crack": round(best_precision, 3),
-        "recall_crack": round(best_recall, 3),
-        "f1_crack": round(best_f1, 3),
-        "epochs": args.epochs,
-        "train_images": len(train_loader.dataset),
-        "val_images": len(val_loader.dataset),
-        "unfroze_last_block": args.unfreeze_last_block,
-        "positive_class": "crack",
-        # Last-vs-best: shows whether the final epoch beat the saved best checkpoint
-        "last_epoch": {
+        "best_precision_crack": round(best_precision_final, 3),
+        "best_recall_crack": round(best_recall_final, 3),
+        "best_f1_crack": round(best_f1_final, 3),
+        "selection_metric": args.selection_metric,
+        "best_selection_metric_value": round(best_selection, 3),
+        "final_epoch": {
             "val_accuracy": round(last_acc, 2),
             "precision_crack": round(last_precision, 3),
             "recall_crack": round(last_recall, 3),
             "f1_crack": round(last_f1, 3),
         },
-        "best_epoch": {
-            "val_accuracy": round(best_acc_final, 2),
-            "precision_crack": round(best_precision, 3),
-            "recall_crack": round(best_recall, 3),
-            "f1_crack": round(best_f1, 3),
-        },
-        "model_selection_metric": args.selection_metric,
-        "model_selection_polarity": "higher_is_better",
+        "train_images": len(train_loader.dataset),
+        "val_images": len(val_loader.dataset),
+        "epochs": args.epochs,
+        "seed": SEED,
+        "unfroze_last_block": args.unfreeze_last_block,
+        "positive_class": "crack",
     }
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)

@@ -56,6 +56,13 @@ Pick ONE:
   ```
   (Needs a free Kaggle API token — instructions are in the script's docstring.)
 
+- **Use local dataset:** If you have a local dataset with Positive/ and Negative/ folders:
+  ```bash
+  python src/download_data.py --source local --raw_dir dataset
+  ```
+  This reads from `dataset/Positive/*.jpg` and `dataset/Negative/*.jpg` and creates
+  the standard train/val structure with an 80/20 split.
+
 - **More data, real bridges:** SDNET2018 (56k+ images). Manual download
   required, then:
   ```bash
@@ -72,6 +79,8 @@ Pick ONE:
 Either path leaves you with `data/train/{crack,no_crack}` and
 `data/val/{crack,no_crack}` full of images, which is what step 3 expects.
 
+**Note:** The local dataset is not committed to GitHub to avoid repository bloat.
+
 ### Step 3 — Train the classifier (~20-60 min depending on hardware)
 
 ```bash
@@ -80,7 +89,11 @@ python src/train_classifier.py --data_dir data --epochs 10
 
 This fine-tunes a ResNet18 pretrained on ImageNet, freezing everything
 except the final layer (fast, works well with a few thousand images).
-Expect 90%+ validation accuracy on the public datasets — they're clean.
+
+For a quick smoke test to verify the pipeline works:
+```bash
+python src/train_classifier.py --data_dir data --epochs 2 --max_per_class 500
+```
 
 Outputs land in `models/`:
 - `crack_classifier.pth` — the trained weights the app loads
@@ -88,7 +101,7 @@ Outputs land in `models/`:
 - `confusion_matrix.png` — for your README
 - `metrics.json` — final numbers, copy straight into the results table below
 
-**If accuracy plateaus below ~90%:**
+**If accuracy plateaus:**
 ```bash
 python src/train_classifier.py --data_dir data --epochs 15 --unfreeze_last_block
 ```
@@ -147,12 +160,12 @@ what an interviewer actually looks at.)*
 ## The one paragraph for interviews
 
 *(Fill in after training, e.g.:)* "I built a crack-detection model using
-transfer learning on ResNet18, trained on [dataset], hitting [X]% validation
-accuracy. It's wrapped in a Streamlit app where you upload a structural
-photo and get a flagged prediction with confidence. The real-world angle:
-this could pre-screen thousands of drone or site-inspection photos and
-surface only the ones an engineer actually needs to look at closely,
-cutting manual review time significantly."
+transfer learning on ResNet18, trained on [dataset]. It's wrapped in a
+Streamlit app where you upload a structural photo and get a flagged
+prediction with model confidence score. The real-world angle: this could
+pre-screen thousands of drone or site-inspection photos and surface only
+the ones an engineer actually needs to look at closely, cutting manual
+review time significantly."
 
 ---
 
@@ -165,3 +178,12 @@ cutting manual review time significantly."
 - The confidence score in the app matters more than a bare yes/no for a
   real inspection workflow — low-confidence predictions should route to
   a human, not get auto-accepted.
+- **Data leakage considerations:** The current random 80/20 split is acceptable
+  for a first prototype, but note that random image-level splitting can lead
+  to overly optimistic validation results if related/source images or patches
+  from the same structure appear in both train and val sets. For better
+  generalization testing, consider:
+  - External evaluation on another dataset such as SDNET2018
+  - Source-level splitting when source/group information is available
+  - The current approach is suitable for prototyping but not for production
+  deployment without additional validation on truly independent data.
