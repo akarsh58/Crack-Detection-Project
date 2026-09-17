@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, models, transforms
@@ -50,6 +51,30 @@ def set_seed(seed: int):
         torch.backends.cudnn.benchmark = False
 
 
+class SafeImageFolder(datasets.ImageFolder):
+    """ImageFolder that removes corrupted images before a loader is created."""
+
+    def __init__(self, root, **kwargs):
+        super().__init__(root, **kwargs)
+        valid_samples = []
+        skipped = 0
+        for path, target in self.samples:
+            try:
+                with Image.open(path) as image:
+                    image.verify()
+                valid_samples.append((path, target))
+            except Exception as exc:
+                skipped += 1
+                print(f"Warning: Skipping corrupted image {path}: {exc}")
+        self.samples = valid_samples
+        self.imgs = self.samples
+        self.targets = [target for _, target in self.samples]
+        if skipped:
+            print(f"Skipped {skipped} corrupted image(s) under {root}")
+        if not self.samples:
+            raise SystemExit(f"No valid images found under {root}")
+
+
 def _limit_per_class(dataset: datasets.ImageFolder, max_per_class: int) -> Subset:
     """Limit to max_per_class images per class using reproducible random sampling."""
     class_indices = {i: [] for i in range(len(dataset.classes))}
@@ -65,7 +90,7 @@ def _limit_per_class(dataset: datasets.ImageFolder, max_per_class: int) -> Subse
     return Subset(dataset, keep)
 
 
-def validate_dataset_structure(data_dir: Path):
+def validate_dataset_structure(data_dir: Path, test_dir: Path | None = None):
     """Validate that the dataset has the expected structure."""
     required_dirs = [
         data_dir / "train",
@@ -88,8 +113,33 @@ def validate_dataset_structure(data_dir: Path):
             if not images:
                 raise SystemExit(f"No images found in {class_dir}")
 
+    # Validate test directory if provided
+    if test_dir is not None:
+        test_required_dirs = [
+            test_dir / "crack",
+            test_dir / "no_crack",
+        ]
+        for dir_path in test_required_dirs:
+            if not dir_path.exists():
+                raise SystemExit(f"Required test directory not found: {dir_path}")
 
-def build_dataloaders(data_dir: Path, batch_size: int, max_per_class: int | None):
+        for class_name in ["crack", "no_crack"]:
+            class_dir = test_dir / class_name
+            images = list(class_dir.glob("*.jpg")) + list(class_dir.glob("*.jpeg")) + list(class_dir.glob("*.png"))
+            if not images:
+                raise SystemExit(f"No images found in {class_dir}")
+
+
+def get_val_transform():
+    """Get the validation transform for use in test set evaluation."""
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+
+
+def build_dataloaders(data_dir: Path, batch_size: int, max_per_class: int | None, device: torch.device):
     train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
@@ -98,20 +148,31 @@ def build_dataloaders(data_dir: Path, batch_size: int, max_per_class: int | None
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
-    val_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
+    val_transform = get_val_transform()
 
-    train_data = datasets.ImageFolder(data_dir / "train", transform=train_transform)
-    val_data = datasets.ImageFolder(data_dir / "val", transform=val_transform)
+    train_data = SafeImageFolder(data_dir / "train", transform=train_transform)
+    val_data = SafeImageFolder(data_dir / "val", transform=val_transform)
 
     class_to_idx = train_data.class_to_idx
+    if val_data.class_to_idx != class_to_idx:
+        raise SystemExit(
+            f"Validation class mapping {val_data.class_to_idx} does not match "
+            f"training mapping {class_to_idx}"
+        )
     print(f"Class mapping: {class_to_idx}")
     if "crack" not in class_to_idx:
         raise SystemExit("Expected a 'crack' class folder under train/. Got: "
                          f"{list(class_to_idx)}")
+
+    # Calculate class weights for handling imbalance
+    class_counts = [0] * len(train_data.classes)
+    for _, label in train_data.samples:
+        class_counts[label] += 1
+    total_samples = sum(class_counts)
+    class_weights = [total_samples / (len(class_counts) * count) for count in class_counts]
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(device)
+    print(f"Class counts: {dict(zip(train_data.classes, class_counts))}")
+    print(f"Class weights: {dict(zip(train_data.classes, class_weights))}")
 
     if max_per_class:
         train_data = _limit_per_class(train_data, max_per_class)
@@ -121,7 +182,7 @@ def build_dataloaders(data_dir: Path, batch_size: int, max_per_class: int | None
     workers = 0 if os.name == "nt" else 2
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=workers)
     val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=workers)
-    return train_loader, val_loader, class_to_idx
+    return train_loader, val_loader, class_to_idx, class_weights_tensor
 
 
 def build_model(unfreeze_last_block: bool, device):
@@ -162,7 +223,7 @@ def evaluate(model, loader, device, pos_label: int):
     precision, recall, f1, _ = precision_recall_fscore_support(
         all_labels, all_preds, average="binary", pos_label=pos_label, zero_division=0
     )
-    cm = confusion_matrix(all_labels, all_preds)
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
     return accuracy, precision, recall, f1, cm
 
 
@@ -191,6 +252,18 @@ def plot_confusion_matrix(cm, class_names, output_dir: Path):
     fig.tight_layout()
     fig.savefig(output_dir / "confusion_matrix.png", dpi=150)
     plt.close(fig)
+
+
+def dataset_class_counts(dataset, class_to_idx):
+    """Count samples by class, including capped Subset datasets."""
+    if isinstance(dataset, Subset):
+        samples = [dataset.dataset.samples[index] for index in dataset.indices]
+    else:
+        samples = dataset.samples
+    return {
+        name: sum(1 for _, target in samples if target == index)
+        for name, index in class_to_idx.items()
+    }
 
 
 def _selection_metric_value(val_acc: float, precision: float, recall: float, f1: float, metric: str) -> float:
@@ -223,8 +296,13 @@ def main():
         "--selection_metric",
         choices=["val_accuracy", "val_f1", "val_recall"],
         default="val_accuracy",
-        help="Metric used to choose the best checkpoint (higher is better)",
+        help="Metric used to choose the best checkpoint. Crack recall/F1 can "
+             "be preferable to accuracy when missed cracks are costly.",
     )
+    parser.add_argument("--early_stopping_patience", type=int, default=5,
+                        help="Early stopping patience (0 to disable)")
+    parser.add_argument("--test_dir", type=str, default=None,
+                        help="Optional independent test set directory (test/crack, test/no_crack)")
     args = parser.parse_args()
 
     set_seed(SEED)
@@ -233,20 +311,35 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    validate_dataset_structure(data_dir)
+    test_dir = Path(args.test_dir) if args.test_dir else None
+    validate_dataset_structure(data_dir, test_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_loader, val_loader, class_to_idx = build_dataloaders(
-        data_dir, args.batch_size, args.max_per_class
+    train_loader, val_loader, class_to_idx, class_weights = build_dataloaders(
+        data_dir, args.batch_size, args.max_per_class, device
     )
     pos_label = class_to_idx["crack"]
     model = build_model(args.unfreeze_last_block, device)
 
-    criterion = nn.CrossEntropyLoss()
+    # Build test loader if test directory is provided
+    test_loader = None
+    if test_dir is not None:
+        test_data = SafeImageFolder(test_dir, transform=get_val_transform())
+        test_class_to_idx = test_data.class_to_idx
+        if test_class_to_idx != class_to_idx:
+            raise SystemExit(f"Test set class mapping {test_class_to_idx} doesn't match training {class_to_idx}")
+        workers = 0 if os.name == "nt" else 2
+        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=workers)
+        print(f"Test set: {len(test_data)} images")
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=3
+    )
 
     history = {"train_loss": [], "val_acc": [], "val_precision": [], "val_recall": [], "val_f1": []}
     best_selection = -1.0
@@ -256,8 +349,15 @@ def main():
     best_f1 = -1.0
     start_time = time.time()
     best_path = output_dir / "crack_classifier.pth"
+    class_names = [k for k, v in sorted(class_to_idx.items(), key=lambda x: x[1])]
+
+    # Early stopping
+    patience_counter = 0
+    early_stopped = False
+    actual_epochs = 0
 
     for epoch in range(args.epochs):
+        actual_epochs = epoch + 1
         model.train()
         running_loss = 0.0
         for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
@@ -283,19 +383,40 @@ def main():
 
         # Model selection using configurable metric (polarity = higher-is-better)
         selection_val = _selection_metric_value(val_acc, precision, recall, f1, args.selection_metric)
+
+        # Learning rate scheduling based on selection metric
+        scheduler.step(selection_val)
         if selection_val > best_selection:
             best_selection = selection_val
             best_acc = val_acc
             best_precision = precision
             best_recall = recall
             best_f1 = f1
+            patience_counter = 0
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "class_to_idx": class_to_idx,
+                "class_names": class_names,
+                "checkpoint_format_version": 1,
                 "selection_metric": args.selection_metric,
                 "seed": SEED,
                 "epoch": epoch + 1,
+                "architecture": "resnet18",
+                "version": "1.0",
+                "preprocessing": {
+                    "mean": IMAGENET_MEAN,
+                    "std": IMAGENET_STD,
+                    "image_size": (224, 224)
+                },
+                "unfroze_last_block": args.unfreeze_last_block,
+                "num_classes": 2,
             }, best_path)
+        else:
+            patience_counter += 1
+            if args.early_stopping_patience > 0 and patience_counter >= args.early_stopping_patience:
+                print(f"Early stopping triggered after {epoch+1} epochs (patience={args.early_stopping_patience})")
+                early_stopped = True
+                break
 
     elapsed = time.time() - start_time
     print(f"\nTraining finished in {elapsed/60:.1f} min. Best val accuracy: {best_acc:.2f}%")
@@ -309,8 +430,22 @@ def main():
     model.load_state_dict(checkpoint["model_state_dict"])
     best_acc_final, best_precision_final, best_recall_final, best_f1_final, best_cm = evaluate(model, val_loader, device, pos_label)
 
+    # Evaluate on test set if available
+    test_metrics = {}
+    if test_loader is not None:
+        print("\nEvaluating on independent test set...")
+        test_acc, test_precision, test_recall, test_f1, test_cm = evaluate(model, test_loader, device, pos_label)
+        test_metrics = {
+            "test_accuracy": round(test_acc, 2),
+            "test_precision_crack": round(test_precision, 3),
+            "test_recall_crack": round(test_recall, 3),
+            "test_f1_crack": round(test_f1, 3),
+            "test_images": len(test_loader.dataset),
+        }
+        print(f"Test Results: accuracy={test_acc:.2f}%, precision={test_precision:.3f}, "
+              f"recall={test_recall:.3f}, f1={test_f1:.3f}")
+
     plot_training_curves(history, output_dir)
-    class_names = [k for k, v in sorted(class_to_idx.items(), key=lambda x: x[1])]
     plot_confusion_matrix(best_cm, class_names, output_dir)
 
     metrics = {
@@ -328,11 +463,21 @@ def main():
         },
         "train_images": len(train_loader.dataset),
         "val_images": len(val_loader.dataset),
-        "epochs": args.epochs,
+        "class_to_idx": class_to_idx,
+        "class_counts": {
+            "train": dataset_class_counts(train_loader.dataset, class_to_idx),
+            "val": dataset_class_counts(val_loader.dataset, class_to_idx),
+        },
+        "epochs": actual_epochs,
+        "early_stopped": early_stopped,
         "seed": SEED,
         "unfroze_last_block": args.unfreeze_last_block,
         "positive_class": "crack",
     }
+
+    # Add test metrics if available
+    if test_metrics:
+        metrics["test"] = test_metrics
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 

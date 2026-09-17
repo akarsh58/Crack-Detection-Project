@@ -1,12 +1,13 @@
 torch>=2.1.0
 torchvision>=0.16.0
-ultralytics>=8.1.0        # only needed if/when you do Version 2 (YOLO bounding boxes)
 pillow>=10.0.0
 numpy>=1.24.0
-pandas>=2.0.0
 matplotlib>=3.7.0
 scikit-learn>=1.3.0
 streamlit>=1.30.0
 tqdm>=4.66.0
 kagglehub>=0.2.0          # convenience for pulling the Kaggle crack dataset
 datasets>=2.16.0          # fallback download of the same 40k images (no Kaggle token)
+
+# Optional Version 2 dependency:
+# ultralytics>=8.1.0

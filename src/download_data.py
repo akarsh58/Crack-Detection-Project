@@ -32,7 +32,7 @@ from Utah State University's data repository).
 OPTION C: Local dataset with Positive/ and Negative/ folders.
 
 1. Place your dataset in a directory with Positive/ and Negative/ subfolders
-   containing .jpg images.
+   containing .jpg, .jpeg, or .png images.
 2. Run:  python src/download_data.py --source local --raw_dir /path/to/dataset
 
 --------------------------------------------------------------------
@@ -51,6 +51,7 @@ from pathlib import Path
 
 RANDOM_SEED = 42
 VAL_FRACTION = 0.2
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 # Original METU/Özgenel crack dataset (same images as the Kaggle mirror).
 MENDELEY_ZIP_URLS = [
     "https://prod-dcd-datasets-cache-zipfiles.s3.eu-west-1.amazonaws.com/5y9wdsg2zt-2.zip",
@@ -58,24 +59,102 @@ MENDELEY_ZIP_URLS = [
 ]
 
 
-def split_and_copy(image_paths, label, data_root: Path, max_per_class=None):
-    random.seed(RANDOM_SEED)
-    image_paths = list(image_paths)
-    random.shuffle(image_paths)
-    if max_per_class:
-        image_paths = image_paths[:max_per_class]
+def get_image_files(directory: Path):
+    """Get image files recursively with consistent JPG/JPEG/PNG support."""
+    if not directory.exists():
+        return []
+    return sorted(
+        path for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
-    n_val = int(len(image_paths) * VAL_FRACTION)
-    val_paths, train_paths = image_paths[:n_val], image_paths[n_val:]
+
+def validate_image(image_path: Path) -> bool:
+    """Validate that an image file can be opened and is not corrupted."""
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+
+def split_and_copy(image_paths, label, data_root: Path, max_per_class=None):
+    if label not in {"crack", "no_crack"}:
+        raise ValueError(f"Unsupported label: {label}")
+
+    candidates = sorted(Path(p) for p in image_paths)
+    if max_per_class is not None:
+        if max_per_class < 1:
+            raise ValueError("max_per_class must be at least 1")
+        # Sample candidates first so smoke tests do not verify/copy an entire
+        # 40k-image source when only a small cap was requested.
+        candidate_rng = random.Random(RANDOM_SEED)
+        candidate_rng.shuffle(candidates)
+    valid_paths = []
+    invalid_count = 0
+    seen = set()
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if validate_image(path):
+            valid_paths.append(path)
+        else:
+            invalid_count += 1
+        if max_per_class and len(valid_paths) >= max_per_class:
+            break
+
+    if not valid_paths:
+        raise SystemExit(f"No valid images found for class '{label}'.")
+
+    rng = random.Random(RANDOM_SEED)
+    rng.shuffle(valid_paths)
+    n_val = max(1, int(len(valid_paths) * VAL_FRACTION)) if len(valid_paths) > 1 else 0
+    val_paths, train_paths = valid_paths[:n_val], valid_paths[n_val:]
 
     for split, paths in [("train", train_paths), ("val", val_paths)]:
         out_dir = data_root / split / label
         out_dir.mkdir(parents=True, exist_ok=True)
         for p in paths:
-            shutil.copy2(p, out_dir / p.name)
+            # Handle filename collisions by adding a counter.
+            dest_path = out_dir / p.name
+            counter = 1
+            while dest_path.exists():
+                dest_path = out_dir / f"{p.stem}_{counter}{p.suffix}"
+                counter += 1
+            shutil.copy2(p, dest_path)
 
-    print(f"  {label}: {len(train_paths)} train / {len(val_paths)} val")
+    print(
+        f"  {label}: {len(train_paths)} train / {len(val_paths)} val "
+        f"(valid={len(valid_paths)}, skipped_invalid={invalid_count})"
+    )
     return len(train_paths), len(val_paths)
+
+
+def summarize_dataset(data_root: Path):
+    """Print and return the prepared image counts for each split and class."""
+    counts = {}
+    for split in ("train", "val"):
+        counts[split] = {}
+        for label in ("crack", "no_crack"):
+            count = len(get_image_files(data_root / split / label))
+            counts[split][label] = count
+    print("\nPrepared dataset:")
+    for split in ("train", "val"):
+        print(f"  {split}: {counts[split]}")
+    return counts
+
+
+def _clear_prepared_dataset(data_root: Path):
+    """Remove only generated class directories when --clean is requested."""
+    for split in ("train", "val"):
+        for label in ("crack", "no_crack"):
+            target = data_root / split / label
+            if target.exists():
+                shutil.rmtree(target)
 
 
 def _positive_negative_dirs(root: Path):
@@ -89,8 +168,8 @@ def _positive_negative_dirs(root: Path):
 def _split_positive_negative(root: Path, data_root: Path, max_per_class=None):
     positive_dir, negative_dir = _positive_negative_dirs(root)
     print("Splitting into train/val...")
-    train_crack, val_crack = split_and_copy(positive_dir.glob("*.jpg"), "crack", data_root, max_per_class)
-    train_no_crack, val_no_crack = split_and_copy(negative_dir.glob("*.jpg"), "no_crack", data_root, max_per_class)
+    train_crack, val_crack = split_and_copy(get_image_files(positive_dir), "crack", data_root, max_per_class)
+    train_no_crack, val_no_crack = split_and_copy(get_image_files(negative_dir), "no_crack", data_root, max_per_class)
     print(f"Created:")
     print(f"  Train crack: {train_crack}")
     print(f"  Train no_crack: {train_no_crack}")
@@ -100,17 +179,29 @@ def _split_positive_negative(root: Path, data_root: Path, max_per_class=None):
 
 def from_huggingface(data_root: Path, max_per_class=None):
     """Pull the same 40k Özgenel images from Hugging Face (no Kaggle token)."""
-    from datasets import load_dataset
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise SystemExit("Install the 'datasets' package to use --source huggingface.") from exc
 
     print("Downloading mohammadnajeeb/concrete_crack_images from Hugging Face...")
-    ds = load_dataset("mohammadnajeeb/concrete_crack_images")
-    names = [n.lower() for n in ds["train"].features["label"].names]
+    try:
+        ds = load_dataset("mohammadnajeeb/concrete_crack_images")
+    except Exception as exc:
+        raise SystemExit(f"Hugging Face dataset download failed: {exc}") from exc
+    source_split = "train" if "train" in ds else next(iter(ds))
+    names = [n.lower() for n in ds[source_split].features["label"].names]
 
     def dump(split, out_split, cap):
         counts = {"crack": 0, "no_crack": 0}
         for i, row in enumerate(ds[split]):
             raw = names[int(row["label"])]
-            label = "crack" if "pos" in raw else "no_crack"
+            if "pos" in raw or "crack" in raw:
+                label = "crack"
+            elif "neg" in raw or "no_crack" in raw or "uncrack" in raw:
+                label = "no_crack"
+            else:
+                raise SystemExit(f"Unrecognized dataset label: {raw!r}")
             if cap and counts[label] >= cap:
                 if all(counts[k] >= cap for k in counts):
                     break
@@ -124,8 +215,10 @@ def from_huggingface(data_root: Path, max_per_class=None):
 
     val_cap = None if not max_per_class else max(1, int(max_per_class * VAL_FRACTION))
     train_cap = None if not max_per_class else max_per_class - (val_cap or 0)
-    train_counts = dump("train", "train", train_cap)
-    val_split = "validation" if "validation" in ds else "test"
+    train_counts = dump(source_split, "train", train_cap)
+    val_split = "validation" if "validation" in ds else ("test" if "test" in ds else None)
+    if val_split is None:
+        raise SystemExit("Hugging Face dataset has no independent validation or test split.")
     val_counts = dump(val_split, "val", val_cap)
 
     print(f"Created:")
@@ -136,14 +229,20 @@ def from_huggingface(data_root: Path, max_per_class=None):
 
 
 def from_kaggle(data_root: Path, max_per_class=None):
-    import kagglehub
+    try:
+        import kagglehub
+    except ImportError as exc:
+        raise SystemExit("Install the 'kagglehub' package to use --source kaggle.") from exc
 
     print("Downloading via kagglehub (requires ~/.kaggle/kaggle.json)...")
-    path = kagglehub.dataset_download("arunrk7/surface-crack-detection")
+    try:
+        path = kagglehub.dataset_download("arunrk7/surface-crack-detection")
+    except Exception as exc:
+        raise SystemExit(f"Kaggle dataset download failed: {exc}") from exc
     positive_dir, negative_dir = _positive_negative_dirs(Path(path))
     print("Splitting into train/val...")
-    train_crack, val_crack = split_and_copy(positive_dir.glob("*.jpg"), "crack", data_root, max_per_class)
-    train_no_crack, val_no_crack = split_and_copy(negative_dir.glob("*.jpg"), "no_crack", data_root, max_per_class)
+    train_crack, val_crack = split_and_copy(get_image_files(positive_dir), "crack", data_root, max_per_class)
+    train_no_crack, val_no_crack = split_and_copy(get_image_files(negative_dir), "no_crack", data_root, max_per_class)
     print(f"Created:")
     print(f"  Train crack: {train_crack}")
     print(f"  Train no_crack: {train_no_crack}")
@@ -184,8 +283,8 @@ def from_mendeley(data_root: Path, max_per_class=None):
 
     positive_dir, negative_dir = _positive_negative_dirs(extract_dir)
     print("Splitting into train/val...")
-    train_crack, val_crack = split_and_copy(positive_dir.glob("*.jpg"), "crack", data_root, max_per_class)
-    train_no_crack, val_no_crack = split_and_copy(negative_dir.glob("*.jpg"), "no_crack", data_root, max_per_class)
+    train_crack, val_crack = split_and_copy(get_image_files(positive_dir), "crack", data_root, max_per_class)
+    train_no_crack, val_no_crack = split_and_copy(get_image_files(negative_dir), "no_crack", data_root, max_per_class)
     print(f"Created:")
     print(f"  Train crack: {train_crack}")
     print(f"  Train no_crack: {train_no_crack}")
@@ -202,12 +301,14 @@ def from_sdnet(raw_dir: Path, data_root: Path, max_per_class=None):
     We pool everything into two classes regardless of surface type.
     """
     crack_paths, no_crack_paths = [], []
-    for jpg in raw_dir.rglob("*.jpg"):
-        parent = jpg.parent.name.upper()
-        if parent.startswith("C"):
-            crack_paths.append(jpg)
-        elif parent.startswith("U"):
-            no_crack_paths.append(jpg)
+    extensions = ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG']
+    for ext in extensions:
+        for jpg in raw_dir.rglob(ext):
+            parent = jpg.parent.name.upper()
+            if parent.startswith("C"):
+                crack_paths.append(jpg)
+            elif parent.startswith("U"):
+                no_crack_paths.append(jpg)
 
     print(f"Found {len(crack_paths)} cracked / {len(no_crack_paths)} uncracked images.")
     print("Splitting into train/val...")
@@ -234,13 +335,13 @@ def from_local(raw_dir: Path, data_root: Path, max_per_class=None):
     if not negative_dir.exists():
         raise SystemExit(f"Negative directory not found at {negative_dir}")
 
-    positive_images = list(positive_dir.glob("*.jpg"))
-    negative_images = list(negative_dir.glob("*.jpg"))
+    positive_images = get_image_files(positive_dir)
+    negative_images = get_image_files(negative_dir)
 
     if not positive_images:
-        raise SystemExit(f"No .jpg images found in {positive_dir}")
+        raise SystemExit(f"No image files found in {positive_dir}")
     if not negative_images:
-        raise SystemExit(f"No .jpg images found in {negative_dir}")
+        raise SystemExit(f"No image files found in {negative_dir}")
 
     print(f"Found:")
     print(f"  Positive: {len(positive_images)}")
@@ -266,9 +367,13 @@ if __name__ == "__main__":
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--max_per_class", type=int, default=None,
                          help="Optional cap on images per class before the train/val split")
+    parser.add_argument("--clean", action="store_true",
+                        help="Remove existing generated train/val class folders first")
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
+    if args.clean:
+        _clear_prepared_dataset(data_root)
 
     if args.source == "kaggle":
         from_kaggle(data_root, args.max_per_class)
@@ -285,4 +390,7 @@ if __name__ == "__main__":
             raise SystemExit("--raw_dir is required for --source sdnet")
         from_sdnet(Path(args.raw_dir), data_root, args.max_per_class)
 
+    counts = summarize_dataset(data_root)
+    if any(counts[split][label] == 0 for split in counts for label in counts[split]):
+        raise SystemExit("Dataset preparation finished with an empty split/class.")
     print("\nDone. Your data/ folder is ready for train_classifier.py")
