@@ -1,5 +1,39 @@
 # Structural Crack Detector
 
+> **AEC computer-vision portfolio project:** screens civil-infrastructure surface images for visible cracking and provides an evaluation-focused ML workflow.
+
+## Recruiter snapshot
+
+**Target roles:** Construction AI Engineer · AEC Automation Engineer · Infrastructure Inspection / Computer Vision
+
+**What this project demonstrates**
+- Transfer learning for a civil-engineering inspection problem.
+- Reproducible training, validation and independent test evaluation.
+- Precision / recall / F1-aware model selection rather than accuracy-only reporting.
+- A Streamlit inference interface with confidence and model metadata.
+- Engineering awareness of dataset leakage, domain shift and inspection limitations.
+- A clear path from image classification toward crack localization, segmentation and measurement.
+
+**Core stack:** Python · PyTorch / torchvision · ResNet18 · Streamlit · scikit-learn-style evaluation workflow
+
+### Workflow
+
+```text
+Infrastructure image
+        ↓
+Preprocessing
+        ↓
+ResNet18 classifier
+        ↓
+Crack / no-crack prediction
+        ↓
+Confidence + model metadata
+        ↓
+Independent evaluation metrics
+```
+
+---
+
 A ResNet18 image classifier that screens concrete, pavement, bridge-deck, and
 similar surface photos for visible cracks. It is an engineering/ML portfolio
 prototype, not a certified structural inspection system.
